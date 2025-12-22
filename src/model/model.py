@@ -38,11 +38,8 @@ class CandiLlama(nn.Module):
             
             W_embed = self.llama.get_input_embeddings().weight
             x_tilde_embed = torch.matmul(x_tilde_one_hot, W_embed)
-            
             x_corrupted = (1 - self.corruption_lambd ) * x_tilde_embed + self.corruption_lambd  * self.corruption_bias
-            
             x_0_embed = self.llama.get_input_embeddings()(input_ids)
-            
             inputs_embeds = torch.where(m_t.unsqueeze(-1) == 1, x_0_embed, x_corrupted)
             
             outputs = self.llama(
@@ -68,7 +65,6 @@ class CandiLlama(nn.Module):
         device = input_ids.device
 
         t = torch.rand(bsz, 1, device=device)
-        
         alpha_t = 1 - t
         
         r_t = (self.r_max - self.r_min) * t + self.r_min
@@ -77,13 +73,10 @@ class CandiLlama(nn.Module):
         sigma_t = -1 / (inv_phi * torch.sqrt(torch.tensor(2.0)))
 
         m_t = torch.bernoulli(alpha_t.expand(bsz, seq_len))
-        
         m_t = torch.where(attention_mask == 0, torch.ones_like(m_t), m_t)
 
-        x_0_one_hot = F.one_hot(input_ids, num_classes=self.vocab_size).float()
-        
+        x_0_one_hot = F.one_hot(input_ids, num_classes=self.vocab_size).float() 
         noise = torch.randn_like(x_0_one_hot)
-        
         sigma_mask = attention_mask.unsqueeze(-1).float()
         x_tilde = x_0_one_hot + (sigma_t.unsqueeze(-1) * sigma_mask) * noise
 
