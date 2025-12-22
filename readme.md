@@ -1,0 +1,1 @@
+GenAI project (reproduce CANDI paper and have a working model)
