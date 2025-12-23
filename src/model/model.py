@@ -10,7 +10,7 @@ llama_config = LlamaConfig(
     vocab_size=50257,
     hidden_size=768,
     intermediate_size=2048,
-    num_hidden_layers=10,
+    num_hidden_layers=12,
     num_attention_heads=12,
     max_position_embeddings=1024,
     initializer_range=0.02,
@@ -41,6 +41,21 @@ class CandiLlama(nn.Module):
         
         return sigma_t
     
+    def precondition_inputs(self, y_t, m_t, t):
+        sigma_t = self._get_sigma(t).view(-1, 1, 1)
+        
+        inv_scale = 1.0 / torch.sqrt(sigma_t**2 + 1.0)
+        
+        m_t_ext = m_t.unsqueeze(-1)
+        
+        y_t_scaled = torch.where(
+            m_t_ext == 1,
+            y_t,               
+            y_t * inv_scale    
+        )
+        
+        return y_t_scaled
+
     def _get_noising_params(self, t, bsz, seq_len, attention_mask=None):
 
         if len(t.shape)==1:
@@ -72,19 +87,20 @@ class CandiLlama(nn.Module):
         sigma_mask = attention_mask.unsqueeze(-1).float()
         x_tilde = x_0_one_hot + (sigma_t.unsqueeze(-1) * sigma_mask) * noise
 
-        return alpha_t, m_t, x_tilde
+        return alpha_t, m_t, x_tilde, t
     
     def forward(self, input_ids, attention_mask, m_t=None, labels=None):
 
         if self.training:
-            alpha_t, m_t, x_tilde_one_hot = self._get_noising_kernel(input_ids, attention_mask)
+            alpha_t, m_t, x_tilde_one_hot, t = self._get_noising_kernel(input_ids, attention_mask)
             
             W_embed = self.llama.get_input_embeddings().weight
             x_tilde_embed = torch.matmul(x_tilde_one_hot, W_embed)
             x_corrupted = (1 - self.corruption_lambd ) * x_tilde_embed + self.corruption_lambd  * self.corruption_bias
             x_0_embed = self.llama.get_input_embeddings()(input_ids)
             inputs_embeds = torch.where(m_t.unsqueeze(-1) == 1, x_0_embed, x_corrupted)
-            
+            inputs_embeds = self.precondition_inputs(inputs_embeds, m_t, t)
+
             outputs = self.llama(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -94,28 +110,58 @@ class CandiLlama(nn.Module):
             if labels is not None :
                 log_probs = F.log_softmax(outputs.logits, dim=-1)
                 target_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-                weight = torch.clamp(1.0 / (1-alpha_t + 1e-8), max=10.0)
+                weight = torch.clamp(1.0 / (1-alpha_t + 1e-8), max=100.0)
                 outputs.loss = (-target_log_probs * weight).mean()
             return outputs  
                      
-        else : 
+        else:
+            alpha_t, m_t, x_tilde_one_hot, t = self._get_noising_kernel(input_ids, attention_mask)
+            
+            W_embed = self.llama.get_input_embeddings().weight
+            x_tilde_embed = torch.matmul(x_tilde_one_hot, W_embed)
+            x_corrupted = (1 - self.corruption_lambd) * x_tilde_embed + self.corruption_lambd * self.corruption_bias
+            x_0_embed = self.llama.get_input_embeddings()(input_ids)
+            
+            eval_inputs_embeds = torch.where(m_t.unsqueeze(-1) == 1, x_0_embed, x_corrupted)
+            eval_inputs_embeds = self.precondition_inputs(eval_inputs_embeds, m_t, t)
+            
             outputs = self.llama(
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=eval_inputs_embeds,
                 attention_mask=attention_mask,
                 return_dict=True
-                )
+            )
+            
+            if labels is not None:
+                log_probs = F.log_softmax(outputs.logits, dim=-1)
+                target_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+                weight = torch.clamp(1.0 / (1-alpha_t + 1e-8), max=100.0)
+                outputs.loss = (-target_log_probs * weight).mean()
+                
             return outputs
     
-    def generate(self, inputs_ids=None, attention_mask=None, nfe=8, generation_length=128, batch_size=1):
+    def generate(self, prompt_ids=None, nfe=8, generation_length=128, batch_size=1):
         device = self.corruption_bias.device
         
+        if prompt_ids is not None:
+            prompt_len = prompt_ids.shape[1]
+            x_t = torch.cat([
+                prompt_ids, 
+                torch.zeros((batch_size, generation_length - prompt_len), dtype=torch.long, device=device)
+            ], dim=1)
+            is_prompt = torch.zeros((batch_size, generation_length), device=device)
+            is_prompt[:, :prompt_len] = 1
+        else:
+            x_t = torch.zeros((batch_size, generation_length), dtype=torch.long, device=device)
+            is_prompt = torch.zeros((batch_size, generation_length), device=device)
+
         t_start = torch.ones((batch_size, 1), device=device)
         alpha_t, sigma_t, m_t = self._get_noising_params(t_start, batch_size, generation_length)
         
+        m_t = torch.logical_or(m_t, is_prompt).float()
+        
         noise = torch.randn((batch_size, generation_length, self.vocab_size), device=device)
         x_tilde_one_hot = sigma_t.view(batch_size, 1, 1) * noise
-        x_t = torch.argmax(x_tilde_one_hot, dim=-1)
-
+        
         W_embed = self.llama.get_input_embeddings().weight
         x_tilde_embed = torch.matmul(x_tilde_one_hot, W_embed)
         y_cache = (1 - self.corruption_lambd) * x_tilde_embed + self.corruption_lambd * self.corruption_bias 
@@ -127,14 +173,17 @@ class CandiLlama(nn.Module):
             t_next = t_steps[i+1]
             
             y_t = torch.where(m_t.unsqueeze(-1) == 1, self.llama.get_input_embeddings()(x_t), y_cache)
-            
+            y_t_input = self.precondition_inputs(y_t, m_t, t_curr.repeat(batch_size, 1))
+
             outputs = self.llama(
-                inputs_embeds=y_t,
-                attention_mask=attention_mask,
+                inputs_embeds=y_t_input,
                 return_dict=True
             )
             x_s_logits = outputs.logits
             x_hat_s = torch.argmax(x_s_logits, dim=-1)
+            
+            if prompt_ids is not None:
+                x_hat_s = torch.where(is_prompt == 1, x_t, x_hat_s)
 
             sigma_t_val = self._get_sigma(torch.full((batch_size, 1), t_curr, device=device)).view(-1, 1, 1)
             sigma_s_val = self._get_sigma(torch.full((batch_size, 1), t_next, device=device)).view(-1, 1, 1)
@@ -149,7 +198,8 @@ class CandiLlama(nn.Module):
             
             prob_transition = (alpha_next - alpha_curr) / (1 - alpha_curr + 1e-8)
             u = torch.rand((batch_size, generation_length), device=device)
-            m_s_new = u < prob_transition
+            
+            m_s_new = (u < prob_transition) | (is_prompt == 1)
             
             m_s_prime = m_s_new & (m_t == 0)
 
