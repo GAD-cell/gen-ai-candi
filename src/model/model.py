@@ -94,7 +94,8 @@ class CandiLlama(nn.Module):
             if labels is not None :
                 log_probs = F.log_softmax(outputs.logits, dim=-1)
                 target_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-                outputs.loss = (-target_log_probs/ (1.0 - alpha_t)).mean()
+                weight = torch.clamp(1.0 / (1-alpha_t + 1e-8), max=10.0)
+                outputs.loss = (-target_log_probs * weight).mean()
             return outputs  
                      
         else : 
@@ -106,47 +107,54 @@ class CandiLlama(nn.Module):
             return outputs
     
     def generate(self, inputs_ids=None, attention_mask=None, nfe=8, generation_length=128, batch_size=1):
+        device = self.corruption_bias.device
         
-        t = torch.Tensor([1.0])
-        alpha_t, sigma_t, m_t = self._get_noising_params(t, batch_size, generation_length,)
-        noise = torch.randn((batch_size,generation_length,self.vocab_size))
-        x_tilde_one_hot = sigma_t.unsqueeze(-1) * noise
-        # Initial predictions
-        x_t = torch.argmax(x_tilde_one_hot,dim=-1)
+        t_start = torch.ones((batch_size, 1), device=device)
+        alpha_t, sigma_t, m_t = self._get_noising_params(t_start, batch_size, generation_length)
+        
+        noise = torch.randn((batch_size, generation_length, self.vocab_size), device=device)
+        x_tilde_one_hot = sigma_t.view(batch_size, 1, 1) * noise
+        x_t = torch.argmax(x_tilde_one_hot, dim=-1)
 
         W_embed = self.llama.get_input_embeddings().weight
-        # Initial noisy embeddings
-        y_cache = (1 - self.corruption_lambd ) * torch.matmul(x_tilde_one_hot, W_embed) + self.corruption_lambd  * self.corruption_bias 
+        x_tilde_embed = torch.matmul(x_tilde_one_hot, W_embed)
+        y_cache = (1 - self.corruption_lambd) * x_tilde_embed + self.corruption_lambd * self.corruption_bias 
 
-        t_steps = torch.arange(1,-1/nfe,-1/nfe)
-        for t in t_steps :
-            y_t = torch.where(m_t.unsqueeze(-1)==1, self.llama.get_input_embeddings()(x_t), y_cache)
-            # x_s_new from learned posterior 
-            x_s_new = self.llama(
+        t_steps = torch.linspace(1, 0, nfe + 1).to(device)
+        
+        for i in range(len(t_steps) - 1):
+            t_curr = t_steps[i]
+            t_next = t_steps[i+1]
+            
+            y_t = torch.where(m_t.unsqueeze(-1) == 1, self.llama.get_input_embeddings()(x_t), y_cache)
+            
+            outputs = self.llama(
                 inputs_embeds=y_t,
                 attention_mask=attention_mask,
                 return_dict=True
-            ).logits
+            )
+            x_s_logits = outputs.logits
+            x_hat_s = torch.argmax(x_s_logits, dim=-1)
 
-            # mask randomly to create anchor points
-            u = torch.rand((batch_size,generation_length))
-            alpha_s = alpha_t - 1/nfe
-            m_s_new = u < (alpha_s - alpha_t) / (1 - alpha_t)
+            sigma_t_val = self._get_sigma(torch.full((batch_size, 1), t_curr, device=device)).view(-1, 1, 1)
+            sigma_s_val = self._get_sigma(torch.full((batch_size, 1), t_next, device=device)).view(-1, 1, 1)
             
-            # score function
-            x_hat_s = torch.argmax(x_s_new,dim=-1)
-            grad_logp = - (y_t - self.llama.get_input_embeddings()(x_hat_s)) / (sigma_t)**2
+            grad_logp = - (y_t - self.llama.get_input_embeddings()(x_hat_s)) / (sigma_t_val**2 + 1e-8)
+            
+            diff_variance = 0.5 * (sigma_t_val**2 - sigma_s_val**2)
+            y_cache = y_t - diff_variance * grad_logp
 
-            # ODE update
-            s = (t-1/nfe).repeat(batch_size,1)
-            sigma_s = self._get_sigma(s)
-            y_cache = y_t - (sigma_t - sigma_s) * grad_logp
+            alpha_curr = 1 - t_curr
+            alpha_next = 1 - t_next
+            
+            prob_transition = (alpha_next - alpha_curr) / (1 - alpha_curr + 1e-8)
+            u = torch.rand((batch_size, generation_length), device=device)
+            m_s_new = u < prob_transition
+            
+            m_s_prime = m_s_new & (m_t == 0)
 
-            m_s_prime = (m_s_new) & (m_t == 0)
             x_t = torch.where(m_t == 1, x_t, torch.where(m_s_prime, x_hat_s, x_t))
             m_t = torch.logical_or(m_t, m_s_new).float()
 
-
         return x_t
-    
 

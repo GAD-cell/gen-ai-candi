@@ -5,6 +5,9 @@ PYTHON := ./$(VENV)/bin/python3
 
 TEST_MODEL_SCRIPT := src/test_model.py
 
+PRETRAIN_MODEL_SCRIPT := src/train/pretrain.py
+CONFIG_PRETRAIN := src/config/pretrain.yaml
+
 
 .PHONY: env 
 
@@ -23,7 +26,8 @@ env:
 test_model:
 	@PYTHONPATH=. $(PYTHON) $(TEST_MODEL_SCRIPT)
 
-
+pretraining:
+	@PYTHONPATH=. $(PYTHON) $(PRETRAIN_MODEL_SCRIPT) 
 
 clean:
 	@echo "Cleaning up..."

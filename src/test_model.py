@@ -14,7 +14,7 @@ outputs = model(dummy_input, attention_mask=dummy_mask, labels=dummy_input)
 print(f"Test Forward. output shape : {outputs.logits.shape}")
 
 # generation 
-outputs_ids = model.generate()
+outputs_ids = model.generate(batch_size=2)
 print(f"Test Generation. output : {outputs}")
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 text = tokenizer.batch_decode(outputs_ids,skip_special_tokens=True)
