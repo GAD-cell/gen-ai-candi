@@ -8,8 +8,8 @@ import os
 from tqdm import tqdm
 import wandb
 
-class PackedDataset(IterableDataset):
-    def __init__(self, tokenizer, context_length=512, languages=["python", "c"], cache_dir=None):
+class CodeParrotDataset(IterableDataset):
+    def __init__(self, tokenizer, context_length=1024, cache_dir=None):
         self.tokenizer = tokenizer
         self.context_length = context_length
         self.cache_dir = cache_dir
@@ -17,31 +17,28 @@ class PackedDataset(IterableDataset):
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
         
-        self.datasets = [
-            load_dataset(
-                "bigcode/the-stack-smol", 
-                data_dir=f"data/{lang}", 
-                split="train", 
-                streaming=True,
-                cache_dir=self.cache_dir
-            )
-            for lang in languages
-        ]
+        # Chargement du dataset CodeParrot en streaming
+        self.dataset = load_dataset(
+            "codeparrot/codeparrot-clean-train",
+            split="train",
+            streaming=True,
+            cache_dir=self.cache_dir
+        )
 
     def __iter__(self):
-        for dataset in self.datasets:
-            for example in dataset:
-                outputs = self.tokenizer(
-                    example["content"],
-                    truncation=True,
-                    max_length=self.context_length,
-                    padding="max_length",
-                    return_tensors="pt"
-                )
-                yield {
-                    "input_ids": outputs["input_ids"].squeeze(0),
-                    "attention_mask": outputs["attention_mask"].squeeze(0)
-                }
+        for example in self.dataset:
+            # On utilise le champ 'content' qui contient le code
+            outputs = self.tokenizer(
+                example["content"],
+                truncation=True,
+                max_length=self.context_length,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            yield {
+                "input_ids": outputs["input_ids"].squeeze(0),
+                "attention_mask": outputs["attention_mask"].squeeze(0)
+            }
 
 CACHE_DIR = "./data/hf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -50,8 +47,8 @@ tokenizer = AutoTokenizer.from_pretrained('gpt2', cache_dir=CACHE_DIR)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-context_length = 512
-train_dataset = PackedDataset(
+context_length = 1024
+train_dataset = CodeParrotDataset(
     tokenizer, 
     context_length=context_length,
     cache_dir=CACHE_DIR
@@ -113,28 +110,12 @@ generation_interval = 50
 
 wandb.init(
     project="candi-llama-pretraining",
-    name="pretrain-run-with-generation",
+    name="pretrain-codeparrot",
     config={
         "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
         "batch_size": batch_size,
         "context_length": context_length,
         "total_steps": total_steps,
-        "warmup_steps": warmup_steps,
-        "warmup_ratio": 0.1,
-        "scheduler": "cosine_with_warmup",
-        "generation_interval": generation_interval,
-        "generation_length": 128,
-        "nfe": 8,
-        "model_config": {
-            "vocab_size": llama_config.vocab_size,
-            "hidden_size": llama_config.hidden_size,
-            "num_layers": llama_config.num_hidden_layers,
-            "num_heads": llama_config.num_attention_heads,
-        },
-        "optimizer": "AdamW",
-        "gradient_clip": 1.0,
-        "languages": ["python", "c"],
     }
 )
 
@@ -167,7 +148,6 @@ for epoch in range(1):
         loss = train_step(model, optimizer, scheduler, batch, device)
         running_loss += loss
         
-
         current_lr = scheduler.get_last_lr()[0]
         
         wandb.log({
@@ -198,13 +178,13 @@ for epoch in range(1):
                 tokenizer=tokenizer,
                 step=i,
                 device=device,
-                num_samples=2,
+                num_samples=1,
                 generation_length=128,
                 nfe=16
             )
             
         if i % 1000 == 0 and i > 0:
-            checkpoint_path = os.path.join(CHECKPOINT_DIR, f"candi_code_step_{i}.pt")
+            checkpoint_path = os.path.join(CHECKPOINT_DIR, f"candi_codeparrot_step_{i}.pt")
             
             torch.save({
                 'step': i,
@@ -221,7 +201,7 @@ for epoch in range(1):
     pbar.close()
 
 
-final_checkpoint_path = os.path.join(CHECKPOINT_DIR, "candi_code_final.pt")
+final_checkpoint_path = os.path.join(CHECKPOINT_DIR, "candi_codeparrot_final.pt")
 torch.save({
     'step': total_steps,
     'model_state_dict': model.state_dict(),
