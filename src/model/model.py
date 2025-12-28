@@ -36,7 +36,7 @@ class CandiLlama(nn.Module):
         self.to(device)
 
     def get_continuous_from_discrete_noise(self, t_discrete):
-        return self.sigma_min * (self.sigma_max / self.sigma_min) ** t_discrete
+        return self.sigma_min * (self.sigma_max / self.sigma_min) ** (2*t_discrete)
 
     def get_inference_sigma(self, t_linear):
         target_percentile = t_linear * (self.max_percentile - self.min_percentile) + self.min_percentile
