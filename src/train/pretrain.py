@@ -8,6 +8,14 @@ import os
 from tqdm import tqdm
 import wandb
 
+total_steps = 10000
+warmup_steps = int(0.1 * total_steps)
+learning_rate = 1e-4
+weight_decay = 1e-3
+batch_size = 16
+generation_interval = 50  
+
+
 class CodeParrotDataset(IterableDataset):
     def __init__(self, tokenizer, context_length=1024, cache_dir=None):
         self.tokenizer = tokenizer
@@ -40,6 +48,38 @@ class CodeParrotDataset(IterableDataset):
                 "attention_mask": outputs["attention_mask"].squeeze(0)
             }
 
+class Text8Dataset(IterableDataset):
+    def __init__(self, tokenizer, context_length=1024, cache_dir=None):
+        self.tokenizer = tokenizer
+        self.context_length = context_length
+        self.cache_dir = cache_dir
+        
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        
+        self.dataset = load_dataset(
+            "afmck/text8-chunked1024",
+            split="train",
+            streaming=True,
+            cache_dir=self.cache_dir
+        )
+
+    def __iter__(self):
+        for example in self.dataset:
+            outputs = self.tokenizer(
+                example["text"],
+                truncation=True,
+                max_length=self.context_length,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            
+            yield {
+                "input_ids": outputs["input_ids"].squeeze(0),
+                "attention_mask": outputs["attention_mask"].squeeze(0)
+            }
+
+
 CACHE_DIR = "./data/hf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -53,7 +93,7 @@ train_dataset = CodeParrotDataset(
     context_length=context_length,
     cache_dir=CACHE_DIR
 )
-train_loader = DataLoader(train_dataset, batch_size=2)
+train_loader = DataLoader(train_dataset, batch_size=batch_size)
 
 
 def train_step(model, optimizer, scheduler, batch, device):
@@ -101,12 +141,6 @@ def generate_and_log(model, tokenizer, step, device, num_samples=2, generation_l
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-total_steps = 10000
-warmup_steps = int(0.1 * total_steps)
-learning_rate = 1e-4
-weight_decay = 1e-3
-batch_size = 2
-generation_interval = 50  
 
 wandb.init(
     project="candi-llama-pretraining",
