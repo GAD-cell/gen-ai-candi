@@ -53,10 +53,17 @@ def sigma_from_time_vectorized(t, sigmas, errors):
 class CandiLlama(nn.Module):
     def __init__(self, llama_config, device):
         super().__init__()
+        self.device = device
+        
         self.llama = LlamaForCausalLM(llama_config)
         self.llama = ReformatModelForDiff(self.llama).get_model()
-        self.vocab_size = llama_config.vocab_size
-
+        
+        original_vocab_size = llama_config.vocab_size
+        self.vocab_size = original_vocab_size + 1 
+        self.mask_index = original_vocab_size
+        
+        self.llama.resize_token_embeddings(self.vocab_size)
+        
         self.corruption_bias = nn.Parameter(torch.zeros(llama_config.hidden_size))
         self.corruption_lambd = 0.5
         
@@ -65,11 +72,10 @@ class CandiLlama(nn.Module):
         self.sigma_max = 2.0 
         self.min_percentile = 0.01
         self.max_percentile = 0.45 
-
-        self.device = device
+        self.is_embed = False
         
         sigmas, errors = build_error_to_sigma_schedule(
-            self.vocab_size, 
+            original_vocab_size, 
             sigma_range=(self.sigma_min, self.sigma_max), 
             device=device
         )
@@ -134,7 +140,9 @@ class CandiLlama(nn.Module):
         outputs.logits = outputs.logits / self.temp
 
         if labels is not None:
-            log_probs = F.log_softmax(outputs.logits, dim=-1)
+            logits_for_loss = outputs.logits[:, :, :self.mask_index]
+            
+            log_probs = F.log_softmax(logits_for_loss, dim=-1)
             target_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
             
             weight = torch.clamp(1.0 / (1 - alpha_t + 1e-8), max=10.0)
@@ -142,34 +150,6 @@ class CandiLlama(nn.Module):
             
         return outputs
 
-    def _discrete_step(self, x_sigma, p_x0, t, dt, prev_clean_mask, noise_removal_step=False): 
-        if noise_removal_step: 
-            s = 0.0
-        else:
-            s = t - dt
-
-
-        t_vec = torch.ones(x_sigma.shape[0], device=x_sigma.device) * t.item()
-        s_vec = torch.ones(x_sigma.shape[0], device=x_sigma.device) * s.item()
-        mask_probs = torch.ones((x_sigma.shape[0], x_sigma.shape[1], 1), device=x_sigma.device) * (s)
-        unmasked_probs = p_x0 * (t_vec - s_vec)[:, None, None]
-
-        q_xs = torch.cat([unmasked_probs, mask_probs], dim=-1)
-        _x = sample_categorical(q_xs)
-        new_clean_mask = (prev_clean_mask.bool() | (_x != self.mask_index)).float()
-
-
-        old_x_tokens=x_sigma.argmax(dim=-1)
-
-
-        sampled_real_tokens = torch.where(_x != self.mask_index, _x, old_x_tokens)
-        updated_tokens = torch.where(prev_clean_mask.bool(), old_x_tokens, sampled_real_tokens)
-        updated_x = torch.nn.functional.one_hot(updated_tokens, num_classes=x_sigma.shape[-1]).float().to(x_sigma.device)
-
-        updated_x = updated_x * new_clean_mask.unsqueeze(-1) + (1 - new_clean_mask).unsqueeze(-1) * x_sigma
-
-        return updated_x, new_clean_mask
-    
     @torch.no_grad()
     def _continuous_step(
         self,
@@ -178,24 +158,75 @@ class CandiLlama(nn.Module):
         time_s: torch.Tensor,
         sigma_s: torch.Tensor,
         sigma_t: torch.Tensor,
-        clean_mask: torch.Tensor=None,
+        clean_mask: torch.Tensor = None,
         is_embed=False,
     ) -> torch.Tensor:
-
-        dt_cont_vec = torch.ones(x.shape[0], device=x.device) * (sigma_s - sigma_t).item()
-        time_t_vec = torch.ones(x.shape[0], device=x.device) * time_t.item()
+        
         sigma_t_vec = torch.ones(x.shape[0], device=x.device) * sigma_t.item()
-        if clean_mask is None: 
+        dt_cont_vec = torch.ones(x.shape[0], device=x.device) * (sigma_s - sigma_t).item()
+        
+        if clean_mask is None:
             clean_mask = torch.zeros(x.shape[:-1], device=x.device)
-        cond_denoised = self.forward(xt=x, discrete_noise=time_t_vec, reveal_mask=clean_mask, continuous_noise=sigma_t_vec, is_embed=is_embed).double()
-        denoised = cond_denoised.exp()
-        if self.is_embed: 
-            x0_hat = self.backbone.get_embedding(denoised)
-        else: 
-            x0_hat = denoised
-        d = (x - x0_hat) / (sigma_t_vec[:, None, None] ** 2)
-        x_cont = x - dt_cont_vec[:, None, None]  * d
-        return x_cont, denoised
+
+        W_embed = self.llama.get_input_embeddings().weight
+        
+        if self.is_embed:
+            inputs_embeds = x
+        else:
+            inputs_embeds = torch.matmul(x, W_embed)
+
+        sigma_reshaped = sigma_t_vec.view(-1, 1, 1)
+        inputs_embeds = self.precondition_inputs(inputs_embeds, clean_mask, sigma_reshaped)
+
+        outputs = self.llama(
+            inputs_embeds=inputs_embeds, 
+            return_dict=True
+        )
+        
+        logits = outputs.logits / self.temp
+        
+        logits_voc = logits[:, :, :self.mask_index]
+        p_x0_voc = torch.softmax(logits_voc, dim=-1)
+        
+        p_x0_full = torch.zeros((x.shape[0], x.shape[1], self.vocab_size), device=x.device)
+        p_x0_full[:, :, :self.mask_index] = p_x0_voc
+
+        if self.is_embed:
+            x0_hat = torch.matmul(p_x0_full, W_embed)
+        else:
+            x0_hat = p_x0_full
+
+        d = (x - x0_hat) / (sigma_t_vec[:, None, None] ** 2 + 1e-8)
+        x_cont = x - dt_cont_vec[:, None, None] * d
+        
+        return x_cont, p_x0_voc
+
+    def _discrete_step(self, x_sigma, p_x0, t, dt, prev_clean_mask, noise_removal_step=False):
+        if noise_removal_step:
+            s = 0.0
+        else:
+            s = t - dt
+
+        t_vec = torch.ones(x_sigma.shape[0], device=x_sigma.device) * t.item()
+        s_vec = torch.ones(x_sigma.shape[0], device=x_sigma.device) * s.item()
+        
+        mask_probs = torch.ones((x_sigma.shape[0], x_sigma.shape[1], 1), device=x_sigma.device) * s
+        unmasked_probs = p_x0 * (t_vec - s_vec)[:, None, None]
+
+        q_xs = torch.cat([unmasked_probs, mask_probs], dim=-1)  
+        _x = sample_categorical(q_xs)
+        
+        mask_idx_in_q = self.mask_index
+        
+        new_clean_mask = (prev_clean_mask.bool() | (_x != mask_idx_in_q)).float()
+        old_x_tokens = x_sigma.argmax(dim=-1)
+        sampled_real_tokens = torch.where(_x != mask_idx_in_q, _x, old_x_tokens)
+        
+        updated_tokens = torch.where(prev_clean_mask.bool(), old_x_tokens, sampled_real_tokens)        
+        updated_x = torch.nn.functional.one_hot(updated_tokens, num_classes=self.vocab_size).float().to(x_sigma.device)
+        updated_x = updated_x * new_clean_mask.unsqueeze(-1) + (1 - new_clean_mask).unsqueeze(-1) * x_sigma
+
+        return updated_x, new_clean_mask
 
 
     @torch.no_grad()
@@ -204,6 +235,7 @@ class CandiLlama(nn.Module):
         num_tokens = generation_length
         
         x = torch.randn((batch_size, num_tokens, self.vocab_size), device=device)
+        
         if self.is_embed:
             x = torch.matmul(x, self.llama.get_input_embeddings().weight)
             
@@ -229,10 +261,7 @@ class CandiLlama(nn.Module):
                 x = prompt_mask.unsqueeze(-1) * full_prompt_one_hot + (1 - prompt_mask.unsqueeze(-1)) * x
 
         timesteps = torch.linspace(0.999, 1e-5, nfe + 1, device=device)
-        
         continuous_noise = self.get_continuous_from_discrete_noise(timesteps)
-
-            
         dt = (1 - 1e-5) / nfe
 
         for i in range(nfe):
@@ -242,7 +271,7 @@ class CandiLlama(nn.Module):
             sigma_s = continuous_noise[i]
             sigma_t = continuous_noise[i+1]
 
-            x_cont, p_x0 = self._continuous_step(
+            x_cont, p_x0_voc = self._continuous_step(
                 x, t, 
                 sigma_s=sigma_s, 
                 sigma_t=sigma_t, 
@@ -252,7 +281,7 @@ class CandiLlama(nn.Module):
             
             x, clean_mask = self._discrete_step(
                 x_cont, 
-                p_x0, 
+                p_x0_voc, 
                 t, 
                 dt, 
                 prev_clean_mask=clean_mask
