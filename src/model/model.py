@@ -67,7 +67,7 @@ class CandiLlama(nn.Module):
         self.corruption_bias = nn.Parameter(torch.zeros(llama_config.hidden_size))
         self.corruption_lambd = 0.5
         
-        self.temp = 0.1 
+        self.temp = 1.0
         self.sigma_min = 0.01
         self.sigma_max = 2.0 
         self.min_percentile = 0.01
@@ -211,19 +211,26 @@ class CandiLlama(nn.Module):
         s_vec = torch.ones(x_sigma.shape[0], device=x_sigma.device) * s.item()
         
         mask_probs = torch.ones((x_sigma.shape[0], x_sigma.shape[1], 1), device=x_sigma.device) * s
+        
         unmasked_probs = p_x0 * (t_vec - s_vec)[:, None, None]
 
-        q_xs = torch.cat([unmasked_probs, mask_probs], dim=-1)  
+        q_xs = torch.cat([unmasked_probs, mask_probs], dim=-1)
+        
         _x = sample_categorical(q_xs)
         
         mask_idx_in_q = self.mask_index
         
         new_clean_mask = (prev_clean_mask.bool() | (_x != mask_idx_in_q)).float()
+
         old_x_tokens = x_sigma.argmax(dim=-1)
+
         sampled_real_tokens = torch.where(_x != mask_idx_in_q, _x, old_x_tokens)
         
-        updated_tokens = torch.where(prev_clean_mask.bool(), old_x_tokens, sampled_real_tokens)        
+        updated_tokens = torch.where(prev_clean_mask.bool(), old_x_tokens, sampled_real_tokens)
+        
+        #num_classes doit être self.vocab_size
         updated_x = torch.nn.functional.one_hot(updated_tokens, num_classes=self.vocab_size).float().to(x_sigma.device)
+
         updated_x = updated_x * new_clean_mask.unsqueeze(-1) + (1 - new_clean_mask).unsqueeze(-1) * x_sigma
 
         return updated_x, new_clean_mask
